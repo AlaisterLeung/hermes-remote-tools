@@ -2,7 +2,7 @@
 
 A Hermes plugin that adds terminal and file operation tools for configured remote SSH hosts. Remote tools reuse the built-in approval stack, process registry, and file-operations layer, with write verification and per-file snapshots on top.
 
-Verified compatible Hermes Agent stable versions: v0.22.0 - v0.22.2
+Verified compatible Hermes Agent versions: v0.22.0 - v0.22.2
 
 ## Remote Tools
 
@@ -23,7 +23,7 @@ Install from Git using CLI:
 hermes plugins install AlaisterLeung/hermes-remote-tools --enable
 ```
 
-Then add at least one host to config.yaml (see below), restart the gateway, and enable the `remote_tools` toolset:
+Then add at least one host to config.yaml (see Configuration below), restart the gateway, and enable the `remote_tools` toolset:
 
 - run `hermes tools` and pick it in the configurator;
 - or add `remote_tools` to the `platform_toolsets` list for each platform that should get the tools.
@@ -59,41 +59,42 @@ plugins:
 
 #### Multiple addresses per host
 
-A machine reachable on more than one network (say, a home LAN plus a VPN) takes a list of addresses in `host`, tried in order with a 2s timeout:
+A machine reachable on more than one network (say, a home LAN plus a VPN) takes a list of addresses in `host`, tried in order with a 2s timeout. Example:
 
 ```yaml
 laptop:
     host:
-        - 192.0.2.101 # home LAN
-        - 198.51.100.10 # VPN
+        - 192.0.2.101
+        - 198.51.100.10
+        - 10.10.100.67
     user: alaister
     key: ~/.ssh/laptop
 ```
 
 ## Development
 
-Run the tests against a throwaway `HERMES_HOME` with the hermes-agent source tree on `PYTHONPATH`:
+### Unit testing
+
+Tests run against a fake environment, not real SSH hosts. Provide the hermes-agent source in `PYTHONPATH` since the plugin imports modules from the core.
 
 ```bash
-HERMES_HOME=$(mktemp -d) PYTHONPATH=<hermes_source> \
-  <hermes venv>/bin/pytest tests/ -o 'addopts=' -q
+PYTHONPATH=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/pytest
 ```
 
-Run the venv pytest binary. Tests run against a fake environment, not real ssh hosts. Beware that you shouldn't run `python -m pytest` from the plugin root since `python -m` puts the cwd on `sys.path` such that the root `tools.py` would shadow the core hermes `tools` package the plugin imports.
-
-Format, lint, and typecheck before committing:
+### Format, lint, and typecheck
 
 ```bash
-<hermes_venv>/bin/ruff format .
-<hermes_venv>/bin/ruff check .
+export HERMES_VENV=~/.hermes/hermes-agent/venv
+$HERMES_VENV/bin/ruff format .
+$HERMES_VENV/bin/ruff check .
 uvx pyright
 ```
 
-### Technical Notes
+### Technical notes
 
-- With `background=true` the terminal process joins the core process registry for completion notifications and standard process management.
-- Snapshots are stored under `<HERMES_HOME>/plugin-data/hermes-remote-tools/snapshots`, capped at 2 MiB per file and 5 kept per path. A file too large to snapshot is not edited at all, rather than mutated without an undo point.
-- `~/.hermes` is never mirrored to a remote host as `sync_files` is always disabled.
-- Remote commands run under bash even when the remote login shell is fish, csh or tcsh. On those hosts the plugin base64-wraps the script through the command line, so the login shell never parses it.
-- Upstream file-mutation verifier and checkpoints cover only the builtin host-local tools, so remote writes are instead covered by a before-mutate snapshot plus a read-back hash verification after the write.
-- Terminal results carry `failed: true` only on a nonzero exit while a success omits the key. Since the failure detector from upstream scans the result text for the key name, not its value, so `"failed": false` on a success payload would be misread as an error.
+- Background execution is supported with `background=true` in which the terminal process joins the process registry for completion notifications and standard process management.
+- Snapshots are stored under `$HERMES_HOME/plugin-data/hermes-remote-tools/snapshots`, capped at 2 MiB per file and 5 snapshots per path. A file too large for snapshot will not be edited at all.
+- `~/.hermes` is not mirrored to a remote host as `sync_files` is always disabled.
+- Remote commands run under bash regardless of the login shell. On non-bash hosts, the plugin wraps the script with base64 through the command line, so the login shell does not parse it.
+- Since the core file-mutation verifier and checkpoints cover only the builtin host-local tools, remote file writes are instead covered by a before-mutate snapshot plus a read-back hash verification after the write.
+- Terminal tool results carry `failed: true` only on a non-zero exit while a success omits the key. This is because `"failed": false` on a success payload would be misread as an error.

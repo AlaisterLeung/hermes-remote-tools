@@ -1,6 +1,6 @@
-"""Bounded before-mutate snapshots for remote files, stored in plugin data.
+"""Snapshots of remote files captured before mutation, stored under the plugin's data dir.
 
-The core file-mutation verifier and checkpoints cover only the builtin host-local tools, so remote writes sit outside both. This module is the remote equivalent: before any write or patch the current file bytes are stashed under plugin-data, an undo restores them, and every entry is capped and trimmed per path.
+Core's file-mutation verifier and checkpoints hardcode the builtin host-local tools and never see remote writes, so this module fills that gap: save() stashes a path's current bytes before any write or patch, pop_latest() returns exactly one undo step, and each path keeps at most _KEEP_PER_PATH snapshots.
 """
 
 import base64
@@ -23,18 +23,22 @@ class SnapshotStore:
 
     def save(self, ops, target: str, path: str) -> str | None:
         """Stash the current remote content of path. Returns the snapshot id, or None when the file does not exist or exceeds the size cap."""
+
         read = ops.read_file_bytes(path, max_bytes=MAX_SNAPSHOT_BYTES)
         if read.error:
-            # missing file is a normal pre-create case; oversize means no undo
             return None
+
         data = base64.b64decode(read.base64_content or "")
         digest = hashlib.sha256(data).hexdigest()[:16]
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
         snap_id = f"{stamp}-{digest}"
+
         blob_dir = self.root / "blobs"
         blob_dir.mkdir(parents=True, exist_ok=True)
+
         blob = blob_dir / f"{snap_id}.bin"
         blob.write_bytes(data)
+
         index_path = self._index_path(target, path)
         entries = self._load(index_path)
         entries.append(
@@ -47,6 +51,7 @@ class SnapshotStore:
             }
         )
         entries = entries[-_KEEP_PER_PATH:]
+
         index_path.parent.mkdir(parents=True, exist_ok=True)
         index_path.write_text(
             json.dumps({"target": target, "path": path, "entries": entries})
@@ -55,10 +60,12 @@ class SnapshotStore:
 
     def pop_latest(self, target: str, path: str) -> bytes | None:
         """Return (and remove) the newest snapshot content for one path."""
+
         index_path = self._index_path(target, path)
         entries = self._load(index_path)
         if not entries:
             return None
+
         entry = entries.pop()
         blob = self.root / "blobs" / entry["blob"]
         try:
@@ -66,6 +73,7 @@ class SnapshotStore:
         except OSError:
             self._write(index_path, target, path, entries)
             return None
+
         blob.unlink(missing_ok=True)
         self._write(index_path, target, path, entries)
         return data
@@ -96,7 +104,8 @@ _default_store: SnapshotStore | None = None
 
 
 def default_store() -> SnapshotStore:
-    """Store rooted at the plugin's own data dir (never the install dir)."""
+    """Store rooted at the plugin's own data dir."""
+
     global _default_store
     if _default_store is None:
         from plugins.plugin_storage import plugin_data_dir

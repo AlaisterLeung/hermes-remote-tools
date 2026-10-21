@@ -1,22 +1,22 @@
-"""Tests for hermes-remote-tools: config handling, guard wiring, snapshot/undo and the tool surface. Handlers run against a fake pool session - no ssh."""
+"""Tests for hermes-remote-tools: config handling, guard wiring, snapshot/undo and the tool surface. Handlers run against a fake pool session instead of real SSH."""
 
 import base64
 import json
 import types
 
 import pytest
-from hermes_plugins.hermes_remote_tools.remote_tools import (
+from hermes_plugins.hermes_remote_tools import (
     common,
-    patch,
-    plugin_state,
+    patch_remote_file,
+    remote_config,
     remote_guards,
     remote_pool,
     remote_snapshots,
-    terminal,
-    undo,
-    write,
+    terminal_remote,
+    undo_remote_file,
+    write_remote_file,
 )
-from hermes_plugins.hermes_remote_tools.tools import TOOLS
+from hermes_plugins.hermes_remote_tools.remote_tools import TOOLS
 from tools.environments.base import EnvironmentConnectionError
 from tools.file_operations_common import (
     PatchResult,
@@ -76,9 +76,7 @@ class FakeOps:
 
 
 def _configure(monkeypatch, targets=None):
-    monkeypatch.setattr(
-        plugin_state, "get_config", lambda *a: targets if targets is not None else {}
-    )
+    monkeypatch.setattr(remote_config, "TARGETS", {} if targets is None else targets)
 
 
 @pytest.fixture
@@ -162,7 +160,9 @@ def test_terminal_remote_blocking_guard(monkeypatch, patched):
         },
     )
     result = json.loads(
-        terminal._handle_terminal_remote({"target": "devbox", "command": "rm -rf /"})
+        terminal_remote._handle_terminal_remote(
+            {"target": "devbox", "command": "rm -rf /"}
+        )
     )
     assert result["status"] == "blocked" and result["failed"] is True
 
@@ -170,7 +170,9 @@ def test_terminal_remote_blocking_guard(monkeypatch, patched):
 def test_terminal_remote_success_and_failure_flag(patched):
     env, _ops, _store = patched
     ok = json.loads(
-        terminal._handle_terminal_remote({"target": "devbox", "command": "hostname"})
+        terminal_remote._handle_terminal_remote(
+            {"target": "devbox", "command": "hostname"}
+        )
     )
     # "failed" is omitted on success: the generic failure detector in core keys on the quoted key name being present in the result text, not its value
     assert ok["returncode"] == 0 and "failed" not in ok and ok["target"] == "devbox"
@@ -179,13 +181,17 @@ def test_terminal_remote_success_and_failure_flag(patched):
         "returncode": 2,
     }
     bad = json.loads(
-        terminal._handle_terminal_remote({"target": "devbox", "command": "falsy"})
+        terminal_remote._handle_terminal_remote(
+            {"target": "devbox", "command": "falsy"}
+        )
     )
     assert bad["failed"] is True and bad["returncode"] == 2
 
 
 def test_unknown_target_errors(patched):
-    payload = terminal._handle_terminal_remote({"target": "nope", "command": "ls"})
+    payload = terminal_remote._handle_terminal_remote(
+        {"target": "nope", "command": "ls"}
+    )
     assert "unknown target" in payload
 
 
@@ -193,14 +199,16 @@ def test_write_snapshot_and_undo_roundtrip(patched):
     _env, ops, store = patched
     ops.files["/etc/motd"] = b"before"
     written = json.loads(
-        write._handle_write_remote_file(
+        write_remote_file._handle_write_remote_file(
             {"target": "devbox", "path": "/etc/motd", "content": "after"}
         )
     )
     assert written["status"] == "written" and written["verified"] is True
     assert store.latest_count("devbox", "/etc/motd") == 1
     undone = json.loads(
-        undo._handle_undo_remote_file({"target": "devbox", "path": "/etc/motd"})
+        undo_remote_file._handle_undo_remote_file(
+            {"target": "devbox", "path": "/etc/motd"}
+        )
     )
     assert undone["status"] == "restored" and undone["bytes"] == 6
     assert _env.written["/etc/motd"] == b"before"
@@ -209,7 +217,7 @@ def test_write_snapshot_and_undo_roundtrip(patched):
 def test_write_refuses_oversize_without_snapshot(patched):
     _env, ops, _store = patched
     ops.files["/big"] = b"x" * (remote_snapshots.MAX_SNAPSHOT_BYTES + 1)
-    payload = write._handle_write_remote_file(
+    payload = write_remote_file._handle_write_remote_file(
         {"target": "devbox", "path": "/big", "content": "n"}
     )
     assert "refusing to edit" in payload
@@ -219,7 +227,7 @@ def test_patch_reports_mutation(patched):
     _env, ops, _store = patched
     ops.files["/etc/motd"] = b"hello world"
     result = json.loads(
-        patch._handle_patch_remote_file(
+        patch_remote_file._handle_patch_remote_file(
             {
                 "target": "devbox",
                 "path": "/etc/motd",
@@ -407,8 +415,7 @@ def _capture_run_ssh(monkeypatch, connect_timeout):
 
 
 def test_run_ssh_injects_short_connect_timeout_before_the_core_default(monkeypatch):
-    """ssh takes the FIRST obtained value per option, so the injected ConnectTimeout must
-    precede the core's hardcoded ConnectTimeout=10 in the argv or it is ignored."""
+    """SSH takes the first obtained value per option, so the injected ConnectTimeout must precede the core's hardcoded ConnectTimeout=10 in the argv or it is ignored."""
     cmd, timeout = _capture_run_ssh(monkeypatch, 2)
     assert cmd[1:3] == ["-o", "ConnectTimeout=2"]
     assert cmd.index("ConnectTimeout=2") < cmd.index("ConnectTimeout=10")
@@ -428,47 +435,7 @@ def test_run_ssh_keeps_the_core_timeout_without_an_override(monkeypatch):
     ]
 
 
-def test_env_kwargs_disables_file_sync_on_real_core():
-    """Regression: the guard must match the core's actual parameter name. SSHEnvironment.__init__ exposes sync_files with a True default, which mirrors the local ~/.hermes (skills + cache) onto the remote host at session creation; older cores spelled it file_sync, so a guard checking only the old name silently stops matching and every session syncs."""
+def test_env_kwargs_disables_sync_files_on_real_core():
+    """SSHEnvironment.__init__ exposes sync_files with a True default, which mirrors the local ~/.hermes (skills + cache) onto the remote host at session creation. _env_kwargs passes sync_files=False to disable this behavior."""
     kwargs = remote_pool._env_kwargs({"host": "h", "user": "u"}, "h")
     assert kwargs.get("sync_files") is False
-
-
-def test_env_kwargs_tolerates_legacy_and_sync_less_cores(monkeypatch):
-    """Cores that spell the switch file_sync (older cores) or lack it entirely must still work: pass the old name through when it is the only one, and nothing when the core never syncs."""
-
-    class LegacyCore:
-        def __init__(
-            self,
-            host,
-            user,
-            cwd="~",
-            timeout=60,
-            port=22,
-            key_path="",
-            probe_only=False,
-            file_sync=True,
-        ):
-            pass
-
-    class NoSyncCore:
-        def __init__(
-            self,
-            host,
-            user,
-            cwd="~",
-            timeout=60,
-            port=22,
-            key_path="",
-            probe_only=False,
-        ):
-            pass
-
-    cfg = {"host": "h", "user": "u", "port": 22, "key": "k", "cwd": "~"}
-    monkeypatch.setattr(remote_pool, "SSHEnvironment", LegacyCore)
-    kwargs = remote_pool._env_kwargs(cfg, "h")
-    assert kwargs["file_sync"] is False and "sync_files" not in kwargs
-    monkeypatch.setattr(remote_pool, "SSHEnvironment", NoSyncCore)
-    kwargs = remote_pool._env_kwargs(cfg, "h")
-    assert "sync_files" not in kwargs and "file_sync" not in kwargs
-    assert kwargs["host"] == "h" and kwargs["key_path"] == "k"

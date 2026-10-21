@@ -8,7 +8,7 @@ TARGET = {
 TERMINAL = {
     "name": "terminal_remote",
     "description": (
-        "Execute shell commands on a configured remote host over ssh (bash semantics; "
+        "Execute shell commands on a configured remote host over SSH (bash semantics; "
         "the remote login shell may be fish - commands still run under bash). "
         "Use it for hosts configured in this plugin's settings; "
         "the local machine is served by the built-in tools. "

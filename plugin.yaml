@@ -1,16 +1,22 @@
 name: hermes-remote-tools
-version: 1.0.0
+version: 1.1.0
 description: >
   Terminal and file operation tools for configured remote SSH hosts.
   Reuses the built-in approval stack, process registry, and file-operations layer,
   with write verification and per-file snapshots on top.
 author: Alaister LJ Leung
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/AlaisterLeung/hermes-remote-tools
+tags: [ssh, remote, cloud, terminal, files]
+requires_hermes: ">=0.22.0"
 config_schema:
   targets:
     type: dict
     required: true
     description: >-
-      Remote SSH backends: host, user, port (default 22), key (path to ssh key), cwd (default ~).
+      Remote SSH backends: host, user, port (default 22), key (path to SSH key), cwd (default ~).
 provides_tools:
   - terminal_remote
   - read_remote_file

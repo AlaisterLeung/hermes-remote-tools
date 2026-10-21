@@ -1,12 +1,12 @@
 ---
 name: remote-hosts
-description: "Use when running commands or file operations on a remote ssh host through the hermes-remote-tools plugin (terminal_remote, read/write/patch/search/undo_remote_file): call shapes, config, verification discipline and pitfalls."
-version: 1.1.0
+description: "Run commands or do file operations on a remote ssh host through the hermes-remote-tools plugin."
+version: 1.1.1
 author: Alaister LJ Leung
-tags: [ssh, remote, terminal, files]
+tags: [ssh, remote, cloud, terminal, files]
 ---
 
-# remote hosts via hermes-remote-tools
+# Remote hosts via hermes-remote-tools
 
 ## When to use
 
@@ -19,7 +19,7 @@ The six tools:
 - `write_remote_file` / `patch_remote_file` - mutations, snapshotted before the edit (undoable) and verified by a read-back hash.
 - `undo_remote_file` - restores the previous content of a file, one step at a time.
 
-## Call shape (the most common refusal)
+## Call shape
 
 The tools are local deferred tools behind the tool_search bridge, so every parameter sits INSIDE the inner call's `arguments` object:
 
@@ -57,7 +57,7 @@ A machine reachable on more than one network takes a list of addresses in `host`
 - Keep `timeout` well under the background-promotion cap: an over-cap timeout promotes the command to a tracked background process.
 - Never put secrets in a command string: the approval layer redacts credential-shaped substrings. Write any credential-touching script with `write_remote_file` and execute the written file.
 
-## Verification discipline (never trust a remote write or read blindly)
+## Verification discipline
 
 - After every remote write, prove the bytes on the target: `ls -la <path>` plus `sha256sum` through `terminal_remote`. A write can report success and a matching read-back hash while landing on the wrong host or nowhere at all.
 - `terminal_remote` is the ground truth for remote file state; cross-check any `read_remote_file` result against it before building on the read.
@@ -75,17 +75,3 @@ Trace a nested shell instead (`bash -x ./script.sh`), and print debug lines plai
 ## Classifying failures
 
 Two layers, do not conflate: a wrapper refusal (`missing required argument(s): target`, or a batched call) is call-shape and fires before any shell sees the command; mangled output or a nonzero exit is execution (shell semantics or quoting). Classify before retrying anything.
-
-## Development gates (plugin repo)
-
-From the plugin root, with a throwaway HERMES_HOME (`<hermes core tree>` is the hermes-agent source checkout, `<venv>` its virtualenv):
-
-```bash
-HERMES_HOME=$(mktemp -d) PYTHONPATH=<hermes core tree> \
-  <venv>/bin/pytest tests/ -o 'addopts=' -q
-<venv>/bin/ruff format . && <venv>/bin/ruff check .
-uvx pyright
-hermes plugins doctor hermes-remote-tools
-```
-
-Run the venv pytest binary, never `python -m pytest` from the plugin root: the root `tools.py` would shadow the core hermes tools package. No test talks to a real ssh host; handlers run against a fake env.

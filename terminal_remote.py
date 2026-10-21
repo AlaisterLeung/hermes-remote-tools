@@ -2,11 +2,9 @@
 
 from tools.registry import tool_error
 
-from ..schemas import TERMINAL
 from . import remote_guards
 from .common import (
     DEFAULT_TIMEOUT,
-    _check_remote_available,
     _dumps,
     _remote_path,
     _session,
@@ -19,6 +17,7 @@ def _handle_terminal_remote(args: dict, task_id: str = "", **_) -> str:
     command = str(args.get("command", "")).strip()
     if not target or not command:
         return tool_error("terminal_remote: both 'target' and 'command' are required.")
+
     try:
         env, _ops = _session(target)
     except TargetError as exc:
@@ -34,17 +33,18 @@ def _handle_terminal_remote(args: dict, task_id: str = "", **_) -> str:
         return _dumps(
             _spawn_background(env, target, command, workdir, task_id, timeout)
         )
+
     result = env.execute(command, cwd=workdir, timeout=timeout)
-    returncode = int(result.get("returncode", -1))
+    return_code = int(result.get("returncode", -1))
     payload: dict = {
         "output": result.get("output", ""),
-        "returncode": returncode,
+        "returncode": return_code,
         "target": target,
         "cwd": getattr(env, "cwd", workdir or "~"),
     }
-    if returncode != 0:
-        # Emit `failed` ONLY on failure. Core's generic failure detector (agent/display._detect_tool_failure) scans result text for the quoted key name `"failed"` without reading its value, so a success payload carrying `"failed": false` is misclassified as an error. Failure stays detectable through the key's value AND the usual nonzero returncode path; error detail rides result["error"] via tool_error separately.
+    if return_code != 0:
         payload["failed"] = True
+
     return _dumps(payload)
 
 
@@ -52,6 +52,7 @@ def _spawn_background(
     env, target: str, command: str, workdir: str, task_id: str, timeout: int
 ) -> dict:
     """Register the remote process in the core process registry so completion notifications, process_manage, stop fan-out and teardown reaping see it."""
+
     from tools.process_registry import process_registry
 
     session = process_registry.spawn_via_env(
@@ -77,6 +78,7 @@ def _spawn_background(
 
 def _route_session(process_registry, session) -> None:
     """Best-effort gateway routing parity with the builtin background spawn."""
+
     try:
         from gateway.session_context import get_session_env
         from tools.terminal_tool_background import _stamp_routing_if_gateway
@@ -84,14 +86,6 @@ def _route_session(process_registry, session) -> None:
         _stamp_routing_if_gateway(
             process_registry, session, get_session_env("HERMES_SESSION_KEY", "")
         )
-    except Exception:  # routing is an enhancement, never a spawn blocker
+    except Exception:
+        # Routing is an enhancement, not a spawn blocker
         pass
-
-
-TOOL = (
-    "terminal_remote",
-    TERMINAL,
-    _handle_terminal_remote,
-    _check_remote_available,
-    "🖥️",
-)

@@ -1,9 +1,9 @@
-"""Shared handler helpers: payload encoding, target resolution, session access, tilde expansion and the pre-mutate snapshot guard."""
+"""Shared handler helpers."""
 
 import json
 from typing import Any
 
-from . import plugin_state, remote_pool, remote_snapshots
+from . import remote_config, remote_pool, remote_snapshots
 from .remote_pool import TargetError
 
 DEFAULT_TIMEOUT = 180
@@ -15,7 +15,7 @@ def _dumps(payload: dict) -> str:
 
 def parse_targets() -> dict:
     try:
-        return remote_pool.parse_targets(plugin_state.get_config())
+        return remote_pool.parse_targets(remote_config.TARGETS)
     except TargetError as exc:
         raise TargetError(str(exc)) from None
 

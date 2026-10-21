@@ -1,4 +1,4 @@
-"""Approval integration: the plugin runs the SAME guard entry as the builtin terminal tool, so smart mode, permanent and session grants, gateway /approve cards and the consecutive-denial breaker all behave identically for remote commands. has_host_access is always False - a remote shell has no host access."""
+"""Approval integration: runs the same guard entry as the builtin terminal tool, so smart mode, permanent and session grants, gateway /approve cards and the consecutive-denial breaker all behave identically for remote commands."""
 
 import logging
 from typing import Any
@@ -9,7 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 def guard_command(command: str, target: str) -> dict[str, Any] | None:
-    """Run the consolidated approval guard. Returns None when approved, else a blocked result dict (ready to serialize as the tool response)."""
+    """Screen a remote command through the same approval stack the builtin terminal uses. Return None for approved commands; otherwise return a tool error response."""
+
     verdict = check_all_command_guards(
         command,
         "ssh",
@@ -17,6 +18,7 @@ def guard_command(command: str, target: str) -> dict[str, Any] | None:
     )
     if verdict.get("approved"):
         return None
+
     detail = {k: v for k, v in verdict.items() if k != "approved"}
     logger.info("remote command blocked by approval guard on target %s", target)
     return {

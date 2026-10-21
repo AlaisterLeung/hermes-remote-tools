@@ -1,17 +1,12 @@
-"""Pool of persistent SSH environments keyed by a spec fingerprint.
+"""Pool of persistent SSH environments, keyed by a target spec fingerprint.
 
-One SSHEnvironment (file sync off, ~/.hermes never mirrored) plus one
-ShellFileOperations wrapper per configured target. The fingerprint covers every connection-relevant field, so a config edit rotates the session instead of silently reusing the old credentials. Bounded LRU: the oldest session is cleaned up when the pool overflows.
+Each target gets one SSHEnvironment (constructed with `sync_files=False` so ~/.hermes is not mirrored) and one ShellFileOperations wrapper. The fingerprint hashes every connection-relevant field, so a config edit rotates the session instead of reusing old credentials. The pool caps at _POOL_CAP live sessions with LRU eviction, and the evicted session is closed rather than leaked.
 
-A target's 'host' may be a single address or an ordered list of fallback
-addresses (a machine reachable on both the home LAN and a VPN, say): the
-first address that connects wins, and a pooled session is probed before
-reuse so a machine that moved networks fails over on the next call.
+A target's 'host' may be a single address or an ordered list of fallbacks: the first address that connects wins, and a pooled session is probed before reuse.
 """
 
 import base64
 import hashlib
-import inspect
 import json
 import logging
 import subprocess
@@ -27,20 +22,20 @@ logger = logging.getLogger(__name__)
 
 _POOL_CAP = 4
 
-# Multi-host targets dial every candidate (and probe the pooled session) with a short
-# ConnectTimeout: a measured healthy connect is ~0.25s, so 2s is 8x headroom, and it caps a
-# blackholed address at 2s instead of the core's hardcoded 10s. Single-host targets are
-# constructed without the override and keep the core default.
+# Multi-host targets dial every candidate and probe the pooled session with a short ConnectTimeout.
+# Single-host targets are constructed without the override and keep the core default.
 _MULTI_HOST_CONNECT_TIMEOUT = 2
 
-# Login shells that cannot parse POSIX-quoted scripts (sshd hands the remote command to the account's login shell, so the core's bash wrapper scripts break on these hosts).
+# Login shells that cannot parse POSIX-quoted scripts:
 _NON_POSIX_LOGIN_SHELLS = ("fish", "csh", "tcsh")
 
 
 class _LoginShellSafeSSHEnvironment(SSHEnvironment):
-    """SSHEnvironment whose remote scripts ride the command line base64-wrapped.
+    """SSHEnvironment variant that survives a fish, csh or tcsh login shell.
 
-    sshd runs the remote command with the account's login shell; where that is fish (or csh/tcsh), the core's multi-line POSIX-quoted bash wrappers fail to parse. The base64 form keeps the outer line quote-free so any login shell can pass it through while bash still executes the real script.
+    sshd runs the remote command through the account's login shell, and the core's multi-line POSIX-quoted bash wrappers do not parse there. The login shell is probed once per session under the class-level _probe_lock; a failed probe keeps the plain core transport, and a shell in _NON_POSIX_LOGIN_SHELLS switches the call to the base64 path.
+
+    On that path the script is encoded onto the command line, decoded into a /tmp file and run with bash, then removes it, so the outer line carries no quoting the login shell could mangle, bash still executes the real script, and stdin stays clear for stdin_data payloads.
     """
 
     _probe_lock = threading.Lock()
@@ -58,13 +53,15 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
         stdin_data: str | None = None,
     ):
         if self._needs_base64_transport():
-            # Temp file, not `bash` at the end of a pipe: the decoded script must not own stdin (payload stdin_data rides it for file writes).
+            # Decode the script into a temp file rather than piping it into bash, so bash does not own stdin.
+            # The payload stdin_data uses it for file writes.
             script = f"/tmp/.hermes-b64-{uuid.uuid4().hex}.sh"
             payload = base64.b64encode(cmd_string.encode()).decode()
             cmd_string = (
                 f"echo {payload} | base64 -d > {script}; "
                 f"bash {script}; rc=$?; rm -f {script}; exit $rc"
             )
+
         return super()._run_bash(
             cmd_string, login=login, timeout=timeout, stdin_data=stdin_data
         )
@@ -72,10 +69,10 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
     def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
         """Shorten the connect timeout on the establishment/probe path for multi-host targets.
 
-        ssh takes the FIRST obtained value per option, so the injected flag must precede the core's
-        hardcoded ConnectTimeout=10 in the argv. Command execution rides _run_bash (its own argv
-        builder, not this method) and keeps the core default.
+        Since SSH takes the first obtained value per option, the injected flag precedes the core's hardcoded ConnectTimeout=10.
+        Command execution uses _run_bash and keeps the core default.
         """
+
         cmd = self._build_ssh_command()
         if self._connect_timeout:
             cmd[1:1] = ["-o", f"ConnectTimeout={self._connect_timeout}"]
@@ -84,20 +81,25 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
     def _needs_base64_transport(self) -> bool:
         if getattr(self, "_b64_probe_done", False):
             return self._b64_needed
+
         with self._probe_lock:
             if getattr(self, "_b64_probe_done", False):
                 return self._b64_needed
+
             shell = ""
             try:
                 proc = self._run_ssh("echo $SHELL", timeout=15)
                 if proc.returncode == 0:
                     shell = proc.stdout.strip().rsplit("/", 1)[-1]
-            except Exception as exc:  # probe failure keeps the plain path
+            except Exception as exc:
+                # Keep the plain path for probe failures
                 logger.debug("login-shell probe failed: %s", exc)
+
             self._b64_needed = shell in _NON_POSIX_LOGIN_SHELLS
             self._b64_probe_done = True
             if self._b64_needed:
                 logger.info("ssh target login shell %r: using base64 transport", shell)
+
             return self._b64_needed
 
 
@@ -112,34 +114,42 @@ class TargetError(ValueError):
 def _hosts(cfg: dict) -> list[str]:
     """Ordered candidate hosts for a target: 'host' may be one address or a list tried in order.
 
-    The list form is what makes a machine that lives on two networks (home LAN plus VPN) reachable under one target name: the first address that connects wins.
+    The list form is what makes a machine that lives on multiple networks reachable under one target name: the first address that connects wins.
     """
+
     raw = cfg.get("host", "")
     if isinstance(raw, (list, tuple)):
         hosts = [str(h).strip() for h in raw]
     else:
         hosts = [str(raw).strip()]
+
     hosts = [h for h in hosts if h]
     if not hosts:
         raise TargetError("needs at least one non-empty 'host'")
+
     return hosts
 
 
 def parse_targets(raw: object) -> dict[str, dict]:
-    """Validate the settings targets mapping; return it unchanged when sane."""
+    """Validate the targets mapping from settings. Returns the mapping unchanged when every entry parses. Raises TargetError on invalid configuration."""
+
     if raw is None or raw == {}:
         return {}
+
     if not isinstance(raw, dict):
         raise TargetError("'targets' must be a mapping of name -> {host, user, ...}")
+
     for name, cfg in raw.items():
         if not isinstance(cfg, dict):
             raise TargetError(f"target {name!r} must be a mapping")
+
         if isinstance(cfg.get("host"), (list, tuple)):
             for entry in cfg["host"]:
                 if not isinstance(entry, str) or not entry.strip():
                     raise TargetError(
                         f"target {name!r}: every 'host' list entry must be a non-empty string"
                     )
+
         for field in ("host", "user"):
             value = cfg.get(field, "")
             if isinstance(value, (list, tuple)):
@@ -151,30 +161,32 @@ def parse_targets(raw: object) -> dict[str, dict]:
                 raise TargetError(
                     f"target {name!r} is missing required field {field!r}"
                 )
+
     return raw
 
 
 def resolve_target(targets: dict, name: str) -> dict:
     """Return the validated config for one target name."""
+
     if not targets:
         raise TargetError(
-            "no remote targets configured. Add them under "
-            "plugins.entries.hermes-remote-tools.settings.targets in config.yaml "
-            "(each: host (one address or a list of fallback addresses), user, optional port/key/cwd)."
+            "no remote targets configured: add them under plugins.entries.hermes-remote-tools.settings.targets in config.yaml"
         )
+
     if name not in targets:
-        raise TargetError(
-            f"unknown target {name!r}. Configured targets: {sorted(targets)}"
-        )
+        raise TargetError(f"unknown target {name!r}")
+
     cfg = targets[name]
     if not isinstance(cfg, dict) or not str(cfg.get("user", "")).strip():
         raise TargetError(f"target {name!r} needs at least 'host' and 'user'")
+
     _hosts(cfg)  # raises TargetError on an empty/blank host list
     return cfg
 
 
 def fingerprint(name: str, cfg: dict) -> str:
     """Stable short id for the connection-relevant spec of one target."""
+
     payload = json.dumps(
         [
             name,
@@ -190,7 +202,8 @@ def fingerprint(name: str, cfg: dict) -> str:
 
 
 def _env_kwargs(cfg: dict, host: str) -> dict:
-    """Build SSHEnvironment kwargs, passing the file-sync switch off under whichever name the core signature exposes (`sync_files` today, `file_sync` on older cores) and omitting it when the core has none."""
+    """Build SSHEnvironment kwargs with sync_files disabled, so ~/.hermes is not mirrored onto the remote host at session creation."""
+
     kwargs = {
         "host": host,
         "user": str(cfg["user"]).strip(),
@@ -198,17 +211,13 @@ def _env_kwargs(cfg: dict, host: str) -> dict:
         "key_path": str(cfg.get("key", "") or ""),
         "cwd": str(cfg.get("cwd", "~") or "~"),
     }
-    params = inspect.signature(SSHEnvironment.__init__).parameters
-    if "sync_files" in params:
-        # Never mirror ~/.hermes to self-managed remote hosts.
-        kwargs["sync_files"] = False
-    elif "file_sync" in params:
-        kwargs["file_sync"] = False
+    kwargs["sync_files"] = False
     return kwargs
 
 
 def _session_alive(env) -> bool:
-    """One ssh round trip over the session's own mux socket: ~10 ms when the connection is up, and a bounded failure (ConnectTimeout=10) once the host moved networks. A single-host target skips the probe - ControlMaster=auto already rebuilds a dead master on the next real command, and the old error shape is unchanged."""
+    """One SSH round trip over the session's own mux socket. A single-host target skips the probe."""
+
     try:
         proc = env._run_ssh("true", timeout=10)
         return proc.returncode == 0
@@ -218,31 +227,37 @@ def _session_alive(env) -> bool:
 
 def _drop(key: str, expected: tuple) -> None:
     """Remove one pooled session and close its mux sockets, unless a newer session already took the slot."""
+
     with _lock:
         if _pool.get(key) is not expected:
             return
         env, _ops = _pool.pop(key)
+
     try:
         env.cleanup()
-    except Exception as exc:  # cleanup must never break a live call
+    except Exception as exc:
         logger.warning("cleanup of dropped ssh session failed: %s", exc)
 
 
 def get_session(name: str, cfg: dict) -> tuple[SSHEnvironment, ShellFileOperations]:
-    """Return the (env, file ops) session for one target, creating it on first use.
+    """Return the (env, file ops) session tuple for one target, creating it on first use.
 
-    Candidate hosts are tried in configured order and the first reachable address wins. For multi-host targets a pooled session is probed before reuse; when the probe fails it is dropped and the address list is walked again, so a machine that moved between networks (home LAN vs VPN) fails over on the next call instead of erroring forever.
+    Candidate hosts are tried in configured order and the first reachable address wins. For multi-host targets, a pooled session is probed before reuse. When the probe fails, it is dropped and the address list is walked again.
     """
+
     hosts = _hosts(cfg)
     key = fingerprint(name, cfg)
     with _lock:
         hit = _pool.get(key)
         if hit is not None:
             _pool.move_to_end(key)
-    if hit is not None and (len(hosts) == 1 or _session_alive(hit[0])):
-        return hit
+
     if hit is not None:
+        if len(hosts) == 1 or _session_alive(hit[0]):
+            return hit
+
         _drop(key, hit)
+
     failures: list[str] = []
     connect_timeout = _MULTI_HOST_CONNECT_TIMEOUT if len(hosts) > 1 else None
     for host in hosts:
@@ -250,12 +265,13 @@ def get_session(name: str, cfg: dict) -> tuple[SSHEnvironment, ShellFileOperatio
             env = _LoginShellSafeSSHEnvironment(
                 **_env_kwargs(cfg, host), connect_timeout=connect_timeout
             )
-        except Exception as exc:  # one dead address must not hide a working one
+        except Exception as exc:
             logger.info(
                 "remote target %r: host %s failed to connect (%s)", name, host, exc
             )
             failures.append(f"{host}: {exc}")
             continue
+
         ops = ShellFileOperations(env)
         with _lock:
             _pool[key] = (env, ops)
@@ -264,9 +280,11 @@ def get_session(name: str, cfg: dict) -> tuple[SSHEnvironment, ShellFileOperatio
                 _, (old_env, _) = _pool.popitem(last=False)
                 try:
                     old_env.cleanup()
-                except Exception as exc:  # cleanup must never break a live call
+                except Exception as exc:
                     logger.warning("cleanup of evicted ssh session failed: %s", exc)
+
         return env, ops
+
     raise TargetError(
         f"target {name!r} is unreachable on every configured host: "
         + "; ".join(failures)
@@ -274,10 +292,12 @@ def get_session(name: str, cfg: dict) -> tuple[SSHEnvironment, ShellFileOperatio
 
 
 def shutdown() -> None:
-    """Clean up every pooled session (plugin unload / process exit)."""
+    """Clean up all pooled sessions."""
+
     with _lock:
         sessions = list(_pool.values())
         _pool.clear()
+
     for env, _ops in sessions:
         try:
             env.cleanup()
