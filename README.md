@@ -2,7 +2,7 @@
 
 A Hermes plugin that adds terminal and file operation tools for configured remote SSH hosts. Remote tools reuse the built-in approval stack, process registry, and file-operations layer, with write verification and per-file snapshots on top.
 
-Verified compatible Hermes Agent versions: v0.22.0 - v0.22.3
+Verified compatible Hermes Agent versions: v0.22.0 - v0.22.5
 
 ## Remote Tools
 
