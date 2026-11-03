@@ -1,5 +1,5 @@
 name: hermes-remote-tools
-version: 1.1.0
+version: 1.1.1
 description: >
   Terminal and file operation tools for configured remote SSH hosts.
   Reuses the built-in approval stack, process registry, and file-operations layer,

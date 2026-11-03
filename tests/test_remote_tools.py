@@ -2,6 +2,7 @@
 
 import base64
 import json
+import threading
 import types
 
 import pytest
@@ -439,3 +440,100 @@ def test_env_kwargs_disables_sync_files_on_real_core():
     """SSHEnvironment.__init__ exposes sync_files with a True default, which mirrors the local ~/.hermes (skills + cache) onto the remote host at session creation. _env_kwargs passes sync_files=False to disable this behavior."""
     kwargs = remote_pool._env_kwargs({"host": "h", "user": "u"}, "h")
     assert kwargs.get("sync_files") is False
+
+
+def _bare_env(probe_answers, cwd="/home/u"):
+    """Build the transport-test env without running __init__, so nothing dials ssh and _run_ssh replays the scripted probe answers (an ('output', rc) tuple or an exception)."""
+
+    env = object.__new__(remote_pool._LoginShellSafeSSHEnvironment)
+    env.host = "10.0.0.9"
+    env._connect_timeout = None
+    env._probe_lock = threading.Lock()
+    env._initial_cwd = "~"
+    env._remote_home = "/home/u"
+    env.cwd = cwd
+    env._sync_manager = None
+    env.probe_calls = 0
+    answers = list(probe_answers)
+
+    def _run_ssh(remote_cmd, timeout=15):
+        env.probe_calls += 1
+        answer = answers.pop(0) if answers else RuntimeError("ssh: connect timed out")
+        if isinstance(answer, Exception):
+            raise answer
+        stdout, rc = answer
+        return types.SimpleNamespace(returncode=rc, stdout=stdout)
+
+    env._run_ssh = _run_ssh
+    return env
+
+
+def test_a_failed_probe_uses_the_base64_path_without_caching_the_answer():
+    """A probe that cannot tell must not pin the session to the POSIX-only transport, since fish rejects the core wrapper the moment a script carries a single quote."""
+
+    env = _bare_env([RuntimeError("connection reset")])
+    assert env._needs_base64_transport() is True
+    assert env.probe_calls == 1
+    assert getattr(env, "_b64_probe_done", False) is False
+
+
+def test_the_probe_keeps_retrying_after_failures_then_locks_in():
+    env = _bare_env([RuntimeError("boom"), ("", 255), ("/bin/bash\n", 0)])
+    assert env._needs_base64_transport() is True
+    assert env._needs_base64_transport() is True
+    assert env._needs_base64_transport() is False
+    assert env.probe_calls == 3
+    assert env._needs_base64_transport() is False
+    assert env.probe_calls == 3
+
+
+def test_probe_detects_fish_from_the_invoked_shell_when_passwd_says_bash():
+    env = _bare_env([("/bin/bash fish\n", 0)])
+    assert env._needs_base64_transport() is True
+    assert env._b64_needed is True
+
+
+def test_probe_reports_a_posix_shell_without_the_base64_path():
+    env = _bare_env([("/bin/bash -bash\n", 0)])
+    assert env._needs_base64_transport() is False
+    assert env.probe_calls == 1
+
+
+def test_run_bash_encodes_the_script_when_the_shell_is_unknown(monkeypatch):
+    env = _bare_env([RuntimeError("boom")])
+    seen: list[str] = []
+    monkeypatch.setattr(
+        remote_pool.SSHEnvironment,
+        "_run_bash",
+        lambda self, cmd_string, **_: seen.append(cmd_string) or "popen",
+    )
+    env._run_bash("echo 'a b'")
+
+    line = seen[0]
+    assert line.startswith("echo ") and "base64 -d >" in line
+    assert "'a b'" not in line  # the quote-sensitive script only travels encoded
+    assert base64.b64decode(line.split(" ")[1]).decode() == "echo 'a b'"
+
+
+def test_a_poisoned_cwd_is_repaired_before_the_next_call(monkeypatch):
+    env = _bare_env([("/bin/bash\n", 0)], cwd="%s")
+    monkeypatch.setattr(
+        remote_pool.SSHEnvironment, "_run_bash", lambda self, cmd_string, **_: "popen"
+    )
+    env._run_bash("true")
+    assert env.cwd == "/home/u"
+
+
+def test_a_real_cwd_is_left_alone():
+    env = _bare_env([("/bin/bash\n", 0)])
+    env.cwd = "/var/log"
+    env._repair_cwd()
+    assert env.cwd == "/var/log"
+
+
+def test_before_execute_repairs_a_poisoned_cwd_before_the_wrapper_is_built():
+    """The wrapper takes its cd from self.cwd before _run_bash sees the script, so the repair has to happen at _before_execute or the poisoning survives the call that heals it."""
+
+    env = _bare_env([("/bin/bash\n", 0)], cwd="%s")
+    env._before_execute()
+    assert env.cwd == "/home/u"

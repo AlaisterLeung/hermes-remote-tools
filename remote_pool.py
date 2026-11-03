@@ -33,16 +33,18 @@ _NON_POSIX_LOGIN_SHELLS = ("fish", "csh", "tcsh")
 class _LoginShellSafeSSHEnvironment(SSHEnvironment):
     """SSHEnvironment variant that survives a fish, csh or tcsh login shell.
 
-    sshd runs the remote command through the account's login shell, and the core's multi-line POSIX-quoted bash wrappers do not parse there. The login shell is probed once per session under the class-level _probe_lock; a failed probe keeps the plain core transport, and a shell in _NON_POSIX_LOGIN_SHELLS switches the call to the base64 path.
+    sshd runs the remote command through the account's login shell, and the core's POSIX-quoted bash wrappers stop parsing there the moment the script carries a single quote, because ``shlex.quote`` renders it as the ``'\\''`` idiom fish rejects. The login shell is probed once per session, and a match in _NON_POSIX_LOGIN_SHELLS sends every call down the base64 path.
 
-    On that path the script is encoded onto the command line, decoded into a /tmp file and run with bash, then removes it, so the outer line carries no quoting the login shell could mangle, bash still executes the real script, and stdin stays clear for stdin_data payloads.
+    An inconclusive probe takes that path for the current call without caching the answer, so one flaky dial at session creation cannot pin the session to a transport its login shell cannot parse.
+
+    On that path the script rides the command line encoded: the remote side decodes it into a /tmp file, runs it with bash, then deletes the file. So the outer line carries no quoting the login shell could mangle, bash still runs the real script, and stdin stays clear for stdin_data payloads.
     """
-
-    _probe_lock = threading.Lock()
 
     def __init__(self, *args, connect_timeout: int | None = None, **kwargs):
         self._connect_timeout = connect_timeout
+        self._probe_lock = threading.Lock()
         super().__init__(*args, **kwargs)
+        self._initial_cwd = self.cwd
 
     def _run_bash(
         self,
@@ -52,6 +54,7 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
         timeout: int = 120,
         stdin_data: str | None = None,
     ):
+        self._repair_cwd()
         if self._needs_base64_transport():
             # Decode the script into a temp file rather than piping it into bash, so bash does not own stdin.
             # The payload stdin_data uses it for file writes.
@@ -65,6 +68,26 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
         return super()._run_bash(
             cmd_string, login=login, timeout=timeout, stdin_data=stdin_data
         )
+
+    def _before_execute(self) -> None:
+        super()._before_execute()
+        self._repair_cwd()
+
+    def _repair_cwd(self) -> None:
+        """Reset a cwd the marker parser filled with the bare format string of a failed call.
+
+        A login-shell parse error mangles the CWD marker, the parser stores its format string as the cwd, and every later call then dies in ``cd`` before the command runs. Restoring the configured cwd keeps the session usable, so no call has to pass an explicit workdir to recover.
+        """
+
+        cwd = str(getattr(self, "cwd", "") or "")
+        if cwd.startswith("/") or "%" not in cwd:
+            return
+
+        fixed = getattr(self, "_remote_home", "") or self._initial_cwd or "~"
+        logger.warning(
+            "ssh target %s: repairing poisoned cwd %r -> %r", self.host, cwd, fixed
+        )
+        self.cwd = fixed
 
     def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
         """Shorten the connect timeout on the establishment/probe path for multi-host targets.
@@ -86,21 +109,48 @@ class _LoginShellSafeSSHEnvironment(SSHEnvironment):
             if getattr(self, "_b64_probe_done", False):
                 return self._b64_needed
 
-            shell = ""
-            try:
-                proc = self._run_ssh("echo $SHELL", timeout=15)
-                if proc.returncode == 0:
-                    shell = proc.stdout.strip().rsplit("/", 1)[-1]
-            except Exception as exc:
-                # Keep the plain path for probe failures
-                logger.debug("login-shell probe failed: %s", exc)
+            shell = self._probe_login_shell()
+            if shell is None:
+                # Unknown shell: take the base64 path for this call and leave the probe uncached, so the next call asks again
+                logger.debug(
+                    "ssh target %s: login-shell probe inconclusive, using base64 transport",
+                    self.host,
+                )
+                return True
 
             self._b64_needed = shell in _NON_POSIX_LOGIN_SHELLS
             self._b64_probe_done = True
             if self._b64_needed:
-                logger.info("ssh target login shell %r: using base64 transport", shell)
+                logger.info(
+                    "ssh target %s: login shell %r, using base64 transport",
+                    self.host,
+                    shell,
+                )
 
             return self._b64_needed
+
+    def _probe_login_shell(self) -> str | None:
+        """Remote login-shell name, or None when the probe cannot tell.
+
+        ``$SHELL`` reports the account's shell and ``$0`` the shell sshd actually handed the command to, so a mismatched passwd entry still resolves. When the two disagree, a non-POSIX name wins.
+        """
+
+        try:
+            proc = self._run_ssh('echo "$SHELL" "$0"', timeout=15)
+        except Exception as exc:
+            logger.debug("login-shell probe failed: %s", exc)
+            return None
+        if proc.returncode != 0:
+            logger.debug("login-shell probe exited %s", proc.returncode)
+            return None
+
+        names = [t.strip().rsplit("/", 1)[-1].lstrip("-") for t in proc.stdout.split()]
+        names = [n for n in names if n]
+        for name in names:
+            if name in _NON_POSIX_LOGIN_SHELLS:
+                return name
+
+        return names[0] if names else None
 
 
 _lock = threading.Lock()

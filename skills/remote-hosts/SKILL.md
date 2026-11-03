@@ -1,7 +1,7 @@
 ---
 name: remote-hosts
 description: "Run commands or do file operations on a remote ssh host through the hermes-remote-tools plugin."
-version: 1.1.1
+version: 1.2.0
 author: Alaister LJ Leung
 tags: [ssh, remote, cloud, terminal, files]
 ---
@@ -51,7 +51,7 @@ A machine reachable on more than one network takes a list of addresses in `host`
 
 ## Execution semantics
 
-- Remote commands run under `bash -c` even when the remote login shell is fish, csh or tcsh: the plugin probes `$SHELL` once per session and, on a non-POSIX login shell, base64-wraps the script through the command line so the login shell never parses it. Write POSIX/bash chains inside the script.
+- Remote commands run under `bash -c` even when the remote login shell is fish, csh or tcsh: the plugin probes `$SHELL` and `$0` once per session and, on a non-POSIX login shell, base64-wraps the script through the command line so the login shell never parses it. Write POSIX/bash chains inside the script. The core wrapper is POSIX-quoted and fish rejects it the moment the script carries a single quote (`shlex.quote` emits the `'\''` idiom fish cannot parse), so a session stuck on the plain transport fails with `fish: Unsupported use of '='` before any command runs. An inconclusive probe uses the base64 path for that call WITHOUT caching the answer, so one flaky dial at session creation cannot pin the session to the transport fish cannot parse; a probe that keeps failing costs one extra round trip per call until it answers.
 - `cd` inline (`cd ~/path && ...`), not through the workdir parameter: a failing `cd` short-circuits the chain, so nothing runs in the wrong directory.
 - Results carry `failed: true` only on a nonzero exit; success omits the key.
 - Keep `timeout` well under the background-promotion cap: an over-cap timeout promotes the command to a tracked background process.
@@ -68,7 +68,9 @@ A machine reachable on more than one network takes a list of addresses in `host`
 
 `set -x` (or `bash -x`) in the command body poisons the pooled session's working directory. The env's per-command wrapper emits its CWD marker with `printf '<marker>%s<marker>' "$(pwd -P)"`, xtrace echoes that printf line, and the marker parser picks the traced FORMAT STRING (the `%s` sitting between two marker occurrences), so `self.cwd` becomes the literal `%s`. Every later call on that target then dies before the command runs: `bash: line 3: cd: %s: No such file or directory` with exit 126 from the wrapper's own `cd ... || exit 126`, and the file tools answer `working directory '%s' does not exist on the active terminal backend`. The real marker line survives in the output unstripped, which is the tell. A long `set -x` command also returns visibly mangled output for the same reason (the strip span eats the traced line and glues its neighbours).
 
-Recovery needs no restart and no config edit: pass an explicit absolute `workdir` on the next call. It overrides the stored cwd (`effective_cwd = cwd or self.cwd`), so the command runs and the wrapper's trailing marker re-parses to the real path. Verified 2026-10-18 on ljair (macOS, git 2.54): poisoning reproduced on demand, one-call recovery after it.
+Recovery needs no restart and no config edit: the plugin repairs a cwd holding a bare format string (`%s`) at `_before_execute`, before the wrapper builds its `cd`, so the call that heals it also succeeds. If a `cd: %s` error still reaches you, pass an explicit absolute `workdir` on the next call: it overrides the stored cwd (`effective_cwd = cwd or self.cwd`), so the command runs and the wrapper's trailing marker re-parses to the real path. Verified 2026-10-18 on ljair (macOS, git 2.54) for the workdir form, 2026-11-02 on cachy650 (fish login) for the self-heal.
+
+A fish login produces the same poisoned cwd from a different trigger: the login shell rejects the POSIX-quoted wrapper, the marker line never prints, and the parser keeps the format string. The transport fix above is what stops it at the source.
 
 Trace a nested shell instead (`bash -x ./script.sh`), and print debug lines plainly rather than turning on `set -x` in the remote command body.
 
